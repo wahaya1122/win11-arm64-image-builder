@@ -1,7 +1,11 @@
 name: Build Win11 ARM64 image (DroidVM)
 
-# Route A from the README: offline DISM apply-image + driver injection + bcdboot, run on an
-# x64 Windows runner (administrator, built-in dism/bcdboot/diskpart). No qemu boot, no Setup.
+# Route A from the README: offline DISM apply-image + driver injection + bcdboot. No qemu boot,
+# no Setup.
+#
+# The runner must be ARM64 Windows: an x64 DISM applies an ARM64 image fine but refuses to inject
+# ARM64 drivers into it ("dism /Add-Driver" -> exit 87, ERROR_INVALID_PARAMETER), which is exactly
+# what route A is built around. windows-11-arm is native ARM64, so every step is same-arch.
 #
 # Output: win11-droidvm-final.qcow2 (bootable on DroidVM/crosvm) + win11-droidvm-final.vmpkg
 # (ready-to-import VM package with the SBSA console config baked in).
@@ -53,9 +57,9 @@ concurrency:
 
 jobs:
   build:
-    # x64 Windows Server 2022: the image route A was written for. Switch to windows-latest if
-    # you prefer (both work; windows-latest may lack tar.exe zstd, so vmpkg falls back to gzip).
-    runs-on: windows-2022
+    # Native ARM64 Windows 11. (windows-2022/windows-2025 are x64 and cannot inject the ARM64
+    # drivers - see the note at the top of this file.)
+    runs-on: windows-11-arm
     timeout-minutes: 300
 
     env:
@@ -139,12 +143,26 @@ jobs:
       - name: Install QEMU (qemu-img)
         shell: powershell
         run: |
-          # QEMU for Windows ships qemu-img.exe in C:\Program Files\qemu and does not touch PATH.
-          choco install qemu -y --no-progress
-          if (-not (Test-Path 'C:\Program Files\qemu\qemu-img.exe')) { throw 'qemu-img.exe not found after choco install' }
-          Test-Path 'C:\Program Files\qemu' | Out-Null
-          "QEMU_DIR=C:\Program Files\qemu" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          & 'C:\Program Files\qemu\qemu-img.exe' --version
+          # The only thing the build needs from QEMU is qemu-img (VHDX -> qcow2). The x64 QEMU
+          # installer would run under ARM64 emulation, so prefer MSYS2's native ARM64 build and
+          # fall back to Chocolatey's x64 package only if MSYS2 is unavailable.
+          $qemuImg = $null
+          $msys = 'C:\msys64\usr\bin\bash.exe'
+          if (Test-Path $msys) {
+            & $msys -lc "pacman -S --noconfirm --needed mingw-w64-clang-aarch64-qemu"
+            $cand = 'C:\msys64\clangarm64\bin\qemu-img.exe'
+            if (Test-Path $cand) { $qemuImg = $cand }
+          }
+          if (-not $qemuImg) {
+            Write-Host '[qemu] MSYS2 native qemu unavailable -> falling back to choco qemu (x64 emulated)'
+            choco install qemu -y --no-progress
+            $cand = 'C:\Program Files\qemu\qemu-img.exe'
+            if (Test-Path $cand) { $qemuImg = $cand }
+          }
+          if (-not $qemuImg) { throw 'qemu-img.exe not found (tried MSYS2 clangarm64 and choco qemu)' }
+          $dir = Split-Path $qemuImg
+          "QEMU_DIR=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          & $qemuImg --version
 
       - name: Download ISO
         shell: powershell
@@ -179,9 +197,13 @@ jobs:
             Write-Host 'MD5 check skipped'
           }
           "SRC_ISO=$SRC" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "TEMP=D:\dvm-tmp" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "TMP=D:\dvm-tmp"  | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          New-Item -ItemType Directory -Force 'D:\dvm-tmp' | Out-Null
+          # Scratch (the expandable VHDX + any ESD->WIM export) goes on the roomiest drive.
+          $scratch = (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -gt 0 } |
+                      Sort-Object -Property Free -Descending | Select-Object -First 1).Name + ':\dvm-tmp'
+          New-Item -ItemType Directory -Force $scratch | Out-Null
+          Write-Host "scratch dir: $scratch"
+          "TEMP=$scratch" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "TMP=$scratch"  | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
       - name: Build qcow2 (+ vmpkg)
         shell: powershell
@@ -199,12 +221,14 @@ jobs:
           QEMU_IMG_INSTALL: '1'
         run: |
           $ErrorActionPreference = 'Stop'
-          $env:PATH = 'C:\Program Files\qemu;' + $env:PATH
+          if ($env:QEMU_DIR) { $env:PATH = "$env:QEMU_DIR;" + $env:PATH }
           # IMAGE_INDEX: empty -> build.ps1 auto-detects (and fails loudly with the list when the ISO
           # has several editions, since CI has no interactive console).
           if ($env:SRC_IMAGE_INDEX) { $env:IMAGE_INDEX = $env:SRC_IMAGE_INDEX }
           if ($env:COMPRESS_FLAG -eq 'true') { $env:COMPRESS = '1' } else { $env:COMPRESS = '0' }
-          Write-Host ("[ci] free space: C: {0:N1} GB, D: {1:N1} GB" -f ((Get-PSDrive C).Free/1GB), ((Get-PSDrive D).Free/1GB))
+          Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $_.Free -gt 0 } |
+            ForEach-Object { Write-Host ("[ci] free space: {0}: {1:N1} GB" -f $_.Name, ($_.Free/1GB)) }
           & "$env:GITHUB_WORKSPACE\windows\build.ps1"
           if ($LASTEXITCODE -ne 0) { throw "build.ps1 failed (exit $LASTEXITCODE)" }
 
