@@ -333,7 +333,17 @@ try {
     $mr = Mount-DiskImage -ImagePath $SRC_ISO -PassThru; $isoMounted = $true
     $isoLetter = ($mr | Get-Volume).DriveLetter
     $wim = "${isoLetter}:\sources\install.wim"
-    if (-not (Test-Path $wim)) { throw "$wim not found in ISO" }
+    # Stock Windows media ships sources\install.wim, but repacked media (tiny11 and friends) ships the
+    # compressed sources\install.esd instead. DISM reads/applies both, so take whichever is there.
+    if (-not (Test-Path $wim)) {
+        $esd = "${isoLetter}:\sources\install.esd"
+        if (Test-Path $esd) {
+            Write-Host "[iso] no sources\install.wim -> using the compressed sources\install.esd" -ForegroundColor DarkYellow
+            $wim = $esd
+        } else {
+            throw "neither sources\install.wim nor sources\install.esd found in ISO ($SRC_ISO)"
+        }
+    }
     Write-Host "[iso] $SRC_ISO"
     $IMAGE_INDEX = Resolve-ImageIndex $wim $IMAGE_INDEX
     Write-Host "[image] using index $IMAGE_INDEX"
@@ -364,8 +374,23 @@ exit
     }
 
     # === 4) Apply image ===
-    Write-Host "[dism] applying install.wim -> $W\ ..."
-    Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Apply-Image", "/ImageFile:$wim", "/Index:$IMAGE_INDEX", "/ApplyDir:$W\") -OutNull -What "dism /Apply-Image"
+    # install.wim applies directly; install.esd (solid LZMS) also applies directly on Win10+ DISM, but if
+    # that ever fails we export it to a plain WIM in the work dir and apply that instead (one retry).
+    Write-Host "[dism] applying $wim -> $W\ ..."
+    try {
+        Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Apply-Image", "/ImageFile:$wim", "/Index:$IMAGE_INDEX", "/ApplyDir:$W\") -OutNull -What "dism /Apply-Image"
+    } catch {
+        if ($wim -notmatch '\.esd$') { throw }
+        Write-Host "  [warn] applying the ESD directly failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        Write-Host "[dism] exporting install.esd -> install.wim, then re-applying ..." -ForegroundColor Yellow
+        # A failed /Apply-Image leaves a partial tree behind -> wipe the volume first.
+        Show-CommandLine "Format-Volume" @("-DriveLetter", $LETTER_WIN, "-FileSystem", "NTFS", '-Confirm:$false')
+        Format-Volume -DriveLetter $LETTER_WIN -FileSystem NTFS -NewFileSystemLabel "Windows" -Confirm:$false -Force | Out-Null
+        $wimTemp = Join-Path $WORK "install.wim"
+        Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Export-Image", "/SourceImageFile:$wim", "/SourceIndex:$IMAGE_INDEX", "/DestinationImageFile:$wimTemp", "/Compress:fast", "/CheckIntegrity") -OutNull -What "dism /Export-Image (esd -> wim)"
+        $wim = $wimTemp
+        Invoke-ExternalCommand -FilePath "dism" -ArgumentList @("/Apply-Image", "/ImageFile:$wim", "/Index:$IMAGE_INDEX", "/ApplyDir:$W\") -OutNull -What "dism /Apply-Image"
+    }
 
     # === 5) Offline driver injection (no signature prompt) ===
     # Offline-inject only the driver subfolders listed in DRIVER_INSTALL (empty=the whole $drvDir /Recurse). /ForceUnsigned skips the signature prompt.
