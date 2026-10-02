@@ -1,0 +1,237 @@
+name: Build Win11 ARM64 image (DroidVM)
+
+# Route A from the README: offline DISM apply-image + driver injection + bcdboot, run on an
+# x64 Windows runner (administrator, built-in dism/bcdboot/diskpart). No qemu boot, no Setup.
+#
+# Output: win11-droidvm-final.qcow2 (bootable on DroidVM/crosvm) + win11-droidvm-final.vmpkg
+# (ready-to-import VM package with the SBSA console config baked in).
+#
+# Triggers: every push to main/master, and manual runs with custom inputs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      src_iso:
+        description: 'Win11 ARM64 ISO (URL or repo-relative path)'
+        required: false
+        default: 'https://archive.org/download/tiny11_25H2/tiny11core_25H2_Oct25_arm64.iso'
+      src_iso_md5:
+        description: 'Expected MD5 of the ISO (empty = skip the check)'
+        required: false
+        default: 'd9fdad2c652c33121bb14cb7c0ce2b3f'
+      image_index:
+        description: 'install.wim image index (empty = auto-detect)'
+        required: false
+        default: ''
+      compress_qcow2:
+        description: 'zstd-compress qcow2 clusters (smaller; needs the new crosvm)'
+        type: boolean
+        default: true
+      upload_qcow2:
+        description: 'Upload the raw .qcow2 artifact (big, ~5 GB)'
+        type: boolean
+        default: true
+      upload_vmpkg:
+        description: 'Upload the import-ready .vmpkg artifact (~5 GB)'
+        type: boolean
+        default: true
+      dvm_username:
+        description: 'Local admin account created at first boot'
+        required: false
+        default: 'USER'
+      dvm_password:
+        description: 'Password for that account'
+        required: false
+        default: 'DroidVM'
+  push:
+    branches: [ main, master ]
+    paths-ignore: [ '**/*.md' ]
+
+concurrency:
+  group: build-win11-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # x64 Windows Server 2022: the image route A was written for. Switch to windows-latest if
+    # you prefer (both work; windows-latest may lack tar.exe zstd, so vmpkg falls back to gzip).
+    runs-on: windows-2022
+    timeout-minutes: 300
+
+    env:
+      IN_SRC_ISO: ${{ github.event.inputs.src_iso }}
+      IN_SRC_ISO_MD5: ${{ github.event.inputs.src_iso_md5 }}
+      IN_IMAGE_INDEX: ${{ github.event.inputs.image_index }}
+      IN_COMPRESS: ${{ github.event.inputs.compress_qcow2 }}
+      IN_UPLOAD_QCOW2: ${{ github.event.inputs.upload_qcow2 }}
+      IN_UPLOAD_VMPKG: ${{ github.event.inputs.upload_vmpkg }}
+      IN_USERNAME: ${{ github.event.inputs.dvm_username }}
+      IN_PASSWORD: ${{ github.event.inputs.dvm_password }}
+      DEFAULT_ISO: 'https://archive.org/download/tiny11_25H2/tiny11core_25H2_Oct25_arm64.iso'
+      DEFAULT_ISO_MD5: 'd9fdad2c652c33121bb14cb7c0ce2b3f'
+      # Repo-local cache dir used by windows/build.ps1 for the ISO / drivers / OpenSSH payload.
+      DVM_FILES: ${{ github.workspace }}\windows\files
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve configuration
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Pick($value, $default) { if ([string]::IsNullOrWhiteSpace($value)) { $default } else { $value } }
+
+          # GitHub sends unset dispatch inputs as '' and booleans as 'true'/'false'; a push-triggered
+          # run has no inputs at all, so defaults are applied here rather than in the expressions.
+          $srcIso   = Pick $env:IN_SRC_ISO   $env:DEFAULT_ISO
+          $srcMd5   = Pick $env:IN_SRC_ISO_MD5 $env:DEFAULT_ISO_MD5
+          $username = Pick $env:IN_USERNAME  'USER'
+          $password = Pick $env:IN_PASSWORD  'DroidVM'
+          $compress = if ([string]::IsNullOrWhiteSpace($env:IN_COMPRESS)) { 'true' } else { $env:IN_COMPRESS }
+          $upQcow   = if ([string]::IsNullOrWhiteSpace($env:IN_UPLOAD_QCOW2)) { 'true' } else { $env:IN_UPLOAD_QCOW2 }
+          $upVmpkg  = if ([string]::IsNullOrWhiteSpace($env:IN_UPLOAD_VMPKG)) { 'true' } else { $env:IN_UPLOAD_VMPKG }
+
+          "SRC_ISO_INPUT=$srcIso"        | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "SRC_ISO_MD5=$srcMd5"          | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "DVM_USERNAME=$username"       | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "DVM_PASSWORD=$password"       | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "COMPRESS_FLAG=$compress"      | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UPLOAD_QCOW2=$upQcow"         | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UPLOAD_VMPKG=$upVmpkg"        | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "SRC_IMAGE_INDEX=$($env:IN_IMAGE_INDEX)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+          Write-Host "ISO       : $srcIso"
+          Write-Host "ISO md5   : $srcMd5"
+          Write-Host "compress  : $compress / upload qcow2=$upQcow vmpkg=$upVmpkg / user=$username"
+
+      - name: Free disk space (C:)
+        shell: powershell
+        run: |
+          # The expandable VHDX and DISM scratch live under %TEMP% on C:; the preinstalled
+          # toolchains below are not needed by this build.
+          $before = (Get-PSDrive C).Free
+          $targets = @(
+            'C:\Program Files\Android',
+            'C:\Program Files\dotnet',
+            'C:\Program Files (x86)\Microsoft SDKs',
+            'C:\Program Files\Microsoft SDKs',
+            'C:\Program Files\Microsoft SQL Server',
+            'C:\Program Files\Microsoft Visual Studio',
+            'C:\Program Files (x86)\Microsoft Visual Studio',
+            'C:\Program Files\Java',
+            'C:\ProgramData\chocolatey\lib\ghc',
+            'C:\ProgramData\chocolatey\lib\mysql',
+            'C:\hostedtoolcache\windows\go',
+            'C:\hostedtoolcache\windows\node',
+            'C:\hostedtoolcache\windows\Ruby',
+            'C:\hostedtoolcache\windows\Java_*'
+          )
+          foreach ($t in $targets) {
+            foreach ($p in (Resolve-Path $t -ErrorAction SilentlyContinue)) {
+              Write-Host "removing $p"
+              Remove-Item -Recurse -Force $p -ErrorAction SilentlyContinue
+            }
+          }
+          $after = (Get-PSDrive C).Free
+          Write-Host ("C: free {0:N1} GB -> {1:N1} GB" -f ($before/1GB), ($after/1GB))
+
+      - name: Install QEMU (qemu-img)
+        shell: powershell
+        run: |
+          # QEMU for Windows ships qemu-img.exe in C:\Program Files\qemu and does not touch PATH.
+          choco install qemu -y --no-progress
+          if (-not (Test-Path 'C:\Program Files\qemu\qemu-img.exe')) { throw 'qemu-img.exe not found after choco install' }
+          Test-Path 'C:\Program Files\qemu' | Out-Null
+          "QEMU_DIR=C:\Program Files\qemu" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          & 'C:\Program Files\qemu\qemu-img.exe' --version
+
+      - name: Download ISO
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force $env:DVM_FILES | Out-Null
+          $iso = Join-Path $env:DVM_FILES 'win11-arm64.iso'
+
+          if ($env:SRC_ISO_INPUT -match '^https?://') {
+            # curl.exe (not the PowerShell alias) for resume + retries on a 3 GB download.
+            $args = @('-L', '--fail', '--retry', '5', '--retry-delay', '10', '--retry-all-errors',
+                      '-C', '-', '--no-progress-meter', '-o', $iso, $env:SRC_ISO_INPUT)
+            & curl.exe @args
+            if ($LASTEXITCODE -ne 0) { throw "curl failed ($LASTEXITCODE) for $($env:SRC_ISO_INPUT)" }
+            $SRC = $iso
+          } else {
+            # Local path handed over by a previous step or committed in the repo.
+            $SRC = $env:SRC_ISO_INPUT
+          }
+          if (-not (Test-Path $SRC)) { throw "ISO not found: $SRC" }
+          $size = (Get-Item $SRC).Length
+          Write-Host ("ISO: {0} ({1:N2} GB)" -f $SRC, ($size/1GB))
+
+          if ($env:SRC_ISO_MD5) {
+            $md5 = (Get-FileHash -Algorithm MD5 -Path $SRC).Hash.ToLower()
+            Write-Host "MD5: $md5 (expected $($env:SRC_ISO_MD5))"
+            if ($md5 -ne $env:SRC_ISO_MD5.ToLower()) {
+              Remove-Item $SRC -Force -ErrorAction SilentlyContinue
+              throw "ISO MD5 mismatch (got $md5, expected $($env:SRC_ISO_MD5)) - partial download removed, re-run"
+            }
+          } else {
+            Write-Host 'MD5 check skipped'
+          }
+          "SRC_ISO=$SRC" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "TEMP=D:\dvm-tmp" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "TMP=D:\dvm-tmp"  | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force 'D:\dvm-tmp' | Out-Null
+
+      - name: Build qcow2 (+ vmpkg)
+        shell: powershell
+        env:
+          OUT_QCOW: win11-droidvm-final.qcow2
+          OUT_VMPKG: win11-droidvm-final.vmpkg
+          DISK_SIZE_MB: '40960'
+          DRIVERS_DIR: 'https://github.com/Droid-VM/gunyah-guest-drivers-windows/releases/download/dev/gunyah-arm64-drivers.zip'
+          OPENSSH_SRC: 'https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-ARM64-v10.0.0.0.msi'
+          DRIVER_DIR: 'ZIP/drivers'
+          DRIVER_INSTALL: 'NetKVM rdmapool pvmpower vioinput viostor vioscsi viosnd viofs'
+          DRIVER_CERT: 'ZIP/DroidVM_Test.cer'
+          VMPKG_COMPRESSION: 'auto'
+          EMS_SAC_SOURCE: 'online'
+          QEMU_IMG_INSTALL: '1'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = 'C:\Program Files\qemu;' + $env:PATH
+          # IMAGE_INDEX: empty -> build.ps1 auto-detects (and fails loudly with the list when the ISO
+          # has several editions, since CI has no interactive console).
+          if ($env:SRC_IMAGE_INDEX) { $env:IMAGE_INDEX = $env:SRC_IMAGE_INDEX }
+          if ($env:COMPRESS_FLAG -eq 'true') { $env:COMPRESS = '1' } else { $env:COMPRESS = '0' }
+          Write-Host ("[ci] free space: C: {0:N1} GB, D: {1:N1} GB" -f ((Get-PSDrive C).Free/1GB), ((Get-PSDrive D).Free/1GB))
+          & "$env:GITHUB_WORKSPACE\windows\build.ps1"
+          if ($LASTEXITCODE -ne 0) { throw "build.ps1 failed (exit $LASTEXITCODE)" }
+
+      - name: Report outputs
+        if: always()
+        shell: powershell
+        run: |
+          Get-ChildItem "$env:GITHUB_WORKSPACE\win11-droidvm-final.*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("{0}  {1:N2} GB" -f $_.Name, ($_.Length/1GB)) }
+
+      - name: Upload qcow2
+        if: always() && env.UPLOAD_QCOW2 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: win11-arm64-droidvm-qcow2
+          path: win11-droidvm-final.qcow2
+          # Already zstd-compressed clusters: don't spend minutes re-zipping.
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload vmpkg
+        if: always() && env.UPLOAD_VMPKG == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: win11-arm64-droidvm-vmpkg
+          path: win11-droidvm-final.vmpkg
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: warn
