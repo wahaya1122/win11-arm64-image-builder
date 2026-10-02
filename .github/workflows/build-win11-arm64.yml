@@ -288,7 +288,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
+          # 'Continue', not 'Stop': under Stop, a native command writing to stderr (gh does that for
+          # "release not found") is promoted to a terminating error before $LASTEXITCODE is checked.
+          # Every gh call below is validated explicitly against $LASTEXITCODE instead.
+          $ErrorActionPreference = 'Continue'
           $repo   = $env:GITHUB_REPOSITORY
           $tag    = $env:RELEASE_TAG
           $ws     = $env:GITHUB_WORKSPACE
@@ -300,6 +303,8 @@ jobs:
           $limit = 1900MB
           $manifest = New-Object System.Collections.Generic.List[string]
           $assets   = New-Object System.Collections.Generic.List[string]
+          $joinNix  = New-Object System.Collections.Generic.List[string]
+          $joinWin  = New-Object System.Collections.Generic.List[string]
           foreach ($name in @('win11-droidvm-final.qcow2', 'win11-droidvm-final.vmpkg')) {
             $path = Join-Path $ws $name
             if (-not (Test-Path $path)) { Write-Host "[release] $name not built, skipping"; continue }
@@ -307,6 +312,7 @@ jobs:
             $manifest.Add(((Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLower() + "  $name"))
             $nParts = [int][math]::Ceiling($len / $limit)
             Write-Host ("[release] {0}: {1:N2} GiB -> {2} part(s)" -f $name, ($len / 1GB), $nParts)
+            $fileParts = New-Object System.Collections.Generic.List[string]
             $fs = [System.IO.File]::OpenRead($path)
             try {
               $buf = New-Object byte[] (8388608)
@@ -326,8 +332,11 @@ jobs:
                 $partName = Split-Path $part -Leaf
                 $manifest.Add(((Get-FileHash -Algorithm SHA256 -Path $part).Hash.ToLower() + "  $partName"))
                 $assets.Add($part)
+                $fileParts.Add($partName)
               }
             } finally { $fs.Close() }
+            $joinNix.Add("  cat $name.part* > $name")
+            $joinWin.Add("  copy /b " + ($fileParts -join '+') + " $name")
           }
           if ($assets.Count -eq 0) { throw 'no build outputs found to publish' }
 
@@ -335,26 +344,28 @@ jobs:
           Set-Content -Encoding ascii -Path $sums -Value $manifest.ToArray()
           $assets.Add($sums)
 
+          # Built with a List, not an array literal: an array nested inside @( ... ) is not flattened
+          # and would stringify to "System.String[]".
+          $lines = New-Object System.Collections.Generic.List[string]
+          foreach ($l in @(
+              'Win11 ARM64 image for DroidVM - split release assets',
+              '',
+              'GitHub caps a release asset at 2 GiB, so each image is published as numbered parts.',
+              'Join the parts first, then check SHA256SUMS.txt:',
+              '',
+              '  # Linux / macOS')) { $lines.Add($l) }
+          $lines.AddRange($joinNix)
+          foreach ($l in @('  sha256sum -c SHA256SUMS.txt', '', '  # Windows (cmd.exe, same folder)')) { $lines.Add($l) }
+          $lines.AddRange($joinWin)
+          foreach ($l in @(
+              '',
+              'Then either import the .vmpkg in the DroidVM app (VM config is baked in: 4 GB RAM,',
+              '4 CPU, swiotlb 256 MB, SBSA console), or point crosvm at the .qcow2 directly.',
+              'The qcow2 has zstd-compressed clusters -> needs the crosvm with qcow2 zstd read support.',
+              '',
+              'Split sizes: 1900 MiB per part, last part is the remainder.')) { $lines.Add($l) }
           $reassemblePath = Join-Path $outDir 'REASSEMBLE.txt'
-          $reassembleText = @(
-            'Win11 ARM64 image for DroidVM - split release assets',
-            '',
-            'GitHub caps a release asset at 2 GiB, so each image is published as numbered parts.',
-            'Join the parts first, then check SHA256SUMS.txt:',
-            '',
-            '  # Linux / macOS',
-            '  cat win11-droidvm-final.vmpkg.part* > win11-droidvm-final.vmpkg',
-            '  sha256sum -c SHA256SUMS.txt',
-            '',
-            '  # Windows (cmd.exe, same folder)',
-            '  copy /b win11-droidvm-final.vmpkg.part01+win11-droidvm-final.vmpkg.part02 win11-droidvm-final.vmpkg',
-            '',
-            'Then either import the .vmpkg in the DroidVM app (VM config is baked in: 4 GB RAM,',
-            '4 CPU, swiotlb 256 MB, SBSA console), or point crosvm at the .qcow2 directly.',
-            'The qcow2 has zstd-compressed clusters -> needs the crosvm with qcow2 zstd read support.',
-            '',
-            'Split sizes: 1900 MiB per part, last part is the remainder.'
-          ) -join "`n"
+          $reassembleText = $lines -join "`n"
           Set-Content -Encoding ascii -Path $reassemblePath -Value $reassembleText
           $assets.Add($reassemblePath)
 
@@ -375,8 +386,10 @@ jobs:
             'Assets are split into <2 GiB parts: see REASSEMBLE.txt and SHA256SUMS.txt.'
           ) -join "`n")
 
-          gh release view $tag --repo $repo --json tagName *> $null
-          if ($LASTEXITCODE -eq 0) {
+          # gh release list (unlike gh release view) writes nothing to stderr when the tag is absent.
+          $tags = @(gh release list --repo $repo --limit 200 --json tagName --jq '.[].tagName')
+          if ($LASTEXITCODE -ne 0) { throw "gh release list failed ($LASTEXITCODE)" }
+          if ($tags -contains $tag) {
             Write-Host "[release] '$tag' exists -> removing its current assets so no stale parts remain"
             $old = @(gh release view $tag --repo $repo --json assets --jq '.assets[].name')
             foreach ($a in $old) {
