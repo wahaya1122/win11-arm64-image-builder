@@ -8,9 +8,16 @@ name: Build Win11 ARM64 image (DroidVM)
 # what route A is built around. windows-11-arm is native ARM64, so every step is same-arch.
 #
 # Output: win11-droidvm-final.qcow2 (bootable on DroidVM/crosvm) + win11-droidvm-final.vmpkg
-# (ready-to-import VM package with the SBSA console config baked in).
+# (ready-to-import VM package with the SBSA console config baked in). Both are uploaded as
+# workflow artifacts and published as GitHub release assets.
+#
+# Release note: GitHub caps a release asset at 2 GiB, and the images are ~3.7 GiB, so the release
+# holds each image as 1900 MiB parts next to SHA256SUMS.txt and REASSEMBLE.txt.
 #
 # Triggers: every push to main/master, and manual runs with custom inputs.
+
+permissions:
+  contents: write   # create the release and upload its assets
 
 on:
   workflow_dispatch:
@@ -47,6 +54,14 @@ on:
         description: 'Password for that account'
         required: false
         default: 'DroidVM'
+      publish_release:
+        description: 'Publish the build to a GitHub release'
+        type: boolean
+        default: true
+      release_tag:
+        description: 'Release tag to publish (the same tag is replaced on every build)'
+        required: false
+        default: 'latest'
   push:
     branches: [ main, master ]
     paths-ignore: [ '**/*.md' ]
@@ -71,6 +86,8 @@ jobs:
       IN_UPLOAD_VMPKG: ${{ github.event.inputs.upload_vmpkg }}
       IN_USERNAME: ${{ github.event.inputs.dvm_username }}
       IN_PASSWORD: ${{ github.event.inputs.dvm_password }}
+      IN_PUBLISH_RELEASE: ${{ github.event.inputs.publish_release }}
+      IN_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
       DEFAULT_ISO: 'https://archive.org/download/tiny11_25H2/tiny11core_25H2_Oct25_arm64.iso'
       DEFAULT_ISO_MD5: 'd9fdad2c652c33121bb14cb7c0ce2b3f'
       # Repo-local cache dir used by windows/build.ps1 for the ISO / drivers / OpenSSH payload.
@@ -95,6 +112,8 @@ jobs:
           $compress = if ([string]::IsNullOrWhiteSpace($env:IN_COMPRESS)) { 'true' } else { $env:IN_COMPRESS }
           $upQcow   = if ([string]::IsNullOrWhiteSpace($env:IN_UPLOAD_QCOW2)) { 'true' } else { $env:IN_UPLOAD_QCOW2 }
           $upVmpkg  = if ([string]::IsNullOrWhiteSpace($env:IN_UPLOAD_VMPKG)) { 'true' } else { $env:IN_UPLOAD_VMPKG }
+          $publish  = if ([string]::IsNullOrWhiteSpace($env:IN_PUBLISH_RELEASE)) { 'true' } else { $env:IN_PUBLISH_RELEASE }
+          $relTag   = Pick $env:IN_RELEASE_TAG 'latest'
 
           "SRC_ISO_INPUT=$srcIso"        | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "SRC_ISO_MD5=$srcMd5"          | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
@@ -104,10 +123,13 @@ jobs:
           "UPLOAD_QCOW2=$upQcow"         | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "UPLOAD_VMPKG=$upVmpkg"        | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "SRC_IMAGE_INDEX=$($env:IN_IMAGE_INDEX)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "UPLOAD_RELEASE=$publish"      | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "RELEASE_TAG=$relTag"          | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
           Write-Host "ISO       : $srcIso"
           Write-Host "ISO md5   : $srcMd5"
           Write-Host "compress  : $compress / upload qcow2=$upQcow vmpkg=$upVmpkg / user=$username"
+          Write-Host "release   : publish=$publish tag=$relTag"
 
       - name: Free disk space (C:)
         shell: powershell
@@ -259,3 +281,116 @@ jobs:
           compression-level: 0
           retention-days: 7
           if-no-files-found: warn
+
+      - name: Publish to release
+        if: success() && env.UPLOAD_RELEASE == 'true'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo   = $env:GITHUB_REPOSITORY
+          $tag    = $env:RELEASE_TAG
+          $ws     = $env:GITHUB_WORKSPACE
+          $outDir = Join-Path $ws 'release'
+          New-Item -ItemType Directory -Force $outDir | Out-Null
+
+          # Release assets are capped at 2 GiB each and the images are ~3.7 GiB, so publish each
+          # image as 1900 MiB parts, with a checksum manifest and reassembly instructions.
+          $limit = 1900MB
+          $manifest = New-Object System.Collections.Generic.List[string]
+          $assets   = New-Object System.Collections.Generic.List[string]
+          foreach ($name in @('win11-droidvm-final.qcow2', 'win11-droidvm-final.vmpkg')) {
+            $path = Join-Path $ws $name
+            if (-not (Test-Path $path)) { Write-Host "[release] $name not built, skipping"; continue }
+            $len = (Get-Item $path).Length
+            $manifest.Add(((Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLower() + "  $name"))
+            $nParts = [int][math]::Ceiling($len / $limit)
+            Write-Host ("[release] {0}: {1:N2} GiB -> {2} part(s)" -f $name, ($len / 1GB), $nParts)
+            $fs = [System.IO.File]::OpenRead($path)
+            try {
+              $buf = New-Object byte[] (8388608)
+              for ($i = 1; $i -le $nParts; $i++) {
+                $part = Join-Path $outDir ("{0}.part{1:D2}" -f $name, $i)
+                $out = [System.IO.File]::Create($part)
+                try {
+                  $left = [long][math]::Min([long]$limit, [long]($len - (($i - 1) * $limit)))
+                  while ($left -gt 0) {
+                    $want = [int][math]::Min($buf.Length, $left)
+                    $read = $fs.Read($buf, 0, $want)
+                    if ($read -le 0) { throw "unexpected EOF in $name (part $i)" }
+                    $out.Write($buf, 0, $read)
+                    $left -= $read
+                  }
+                } finally { $out.Close() }
+                $partName = Split-Path $part -Leaf
+                $manifest.Add(((Get-FileHash -Algorithm SHA256 -Path $part).Hash.ToLower() + "  $partName"))
+                $assets.Add($part)
+              }
+            } finally { $fs.Close() }
+          }
+          if ($assets.Count -eq 0) { throw 'no build outputs found to publish' }
+
+          $sums = Join-Path $outDir 'SHA256SUMS.txt'
+          Set-Content -Encoding ascii -Path $sums -Value $manifest.ToArray()
+          $assets.Add($sums)
+
+          $reassemblePath = Join-Path $outDir 'REASSEMBLE.txt'
+          $reassembleText = @(
+            'Win11 ARM64 image for DroidVM - split release assets',
+            '',
+            'GitHub caps a release asset at 2 GiB, so each image is published as numbered parts.',
+            'Join the parts first, then check SHA256SUMS.txt:',
+            '',
+            '  # Linux / macOS',
+            '  cat win11-droidvm-final.vmpkg.part* > win11-droidvm-final.vmpkg',
+            '  sha256sum -c SHA256SUMS.txt',
+            '',
+            '  # Windows (cmd.exe, same folder)',
+            '  copy /b win11-droidvm-final.vmpkg.part01+win11-droidvm-final.vmpkg.part02 win11-droidvm-final.vmpkg',
+            '',
+            'Then either import the .vmpkg in the DroidVM app (VM config is baked in: 4 GB RAM,',
+            '4 CPU, swiotlb 256 MB, SBSA console), or point crosvm at the .qcow2 directly.',
+            'The qcow2 has zstd-compressed clusters -> needs the crosvm with qcow2 zstd read support.',
+            '',
+            'Split sizes: 1900 MiB per part, last part is the remainder.'
+          ) -join "`n"
+          Set-Content -Encoding ascii -Path $reassemblePath -Value $reassembleText
+          $assets.Add($reassemblePath)
+
+          $notes = (@(
+            'Automated build of the Win11 ARM64 image for DroidVM (Gunyah/crosvm).',
+            '',
+            "- source ISO: $($env:SRC_ISO_INPUT)",
+            "- ISO md5: $($env:SRC_ISO_MD5)",
+            "- runner: windows-11-arm, $($env:GITHUB_SERVER_URL)/$repo/actions/runs/$($env:GITHUB_RUN_ID)",
+            "- image: Windows 11 Pro ARM64 (tiny11core 25H2), testsigning + nointegritychecks on,",
+            '  gunyah virtio drivers injected offline (NetKVM rdmapool pvmpower vioinput viostor vioscsi viosnd viofs)',
+            "- first boot: creates local admin '$($env:DVM_USERNAME)' with autologon, enables SSH (password login) + RDP,",
+            '  debloats (Windows Update off, re-enable with the enable_windows_update.bat on the desktop)',
+            '- SAC: BCD EMS armed; the interactive SAC> runtime is pulled from Windows Update on the',
+            '  first boot of the target VM (needs network there)',
+            '- qcow2 clusters are zstd-compressed -> needs the crosvm with qcow2 zstd read support',
+            '',
+            'Assets are split into <2 GiB parts: see REASSEMBLE.txt and SHA256SUMS.txt.'
+          ) -join "`n")
+
+          gh release view $tag --repo $repo --json tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "[release] '$tag' exists -> removing its current assets so no stale parts remain"
+            $old = @(gh release view $tag --repo $repo --json assets --jq '.assets[].name')
+            foreach ($a in $old) {
+              if (-not $a) { continue }
+              gh release delete-asset $tag $a --repo $repo --yes
+              if ($LASTEXITCODE -ne 0) { throw "gh release delete-asset '$a' failed ($LASTEXITCODE)" }
+            }
+          } else {
+            gh release create $tag --repo $repo --title "Win11 ARM64 for DroidVM ($tag)" --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release create '$tag' failed ($LASTEXITCODE)" }
+          }
+
+          $files = @($assets | ForEach-Object { $_ })
+          Write-Host "[release] uploading $($files.Count) asset(s) to '$tag' ..."
+          gh release upload $tag @files --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed ($LASTEXITCODE)" }
+          Write-Host "[release] done: $($env:GITHUB_SERVER_URL)/$repo/releases/tag/$tag" -ForegroundColor Green
