@@ -216,7 +216,14 @@ function Resolve-ImageIndex([string]$wim, [int]$wanted) {
         Write-Host ("  [{0}] {1}  ({2:N1} GB)" -f $im.ImageIndex, $im.ImageName, ($im.ImageSize / 1GB))
     }
     if ([Console]::IsInputRedirected) {
-        throw ("IMAGE_INDEX not set and no interactive console. Set IMAGE_INDEX to one of: " + ($valid -join ', '))
+        # Non-interactive (CI). Pick Professional when the media has it: EditionId is language-neutral,
+        # unlike ImageName which is localized (e.g. "专业版" on zh-cn media). IMAGE_INDEX still overrides.
+        $pick = $images | Where-Object { $_.EditionId -eq 'Professional' } | Select-Object -First 1
+        if (-not $pick) { $pick = $images | Where-Object { $_.ImageName -match 'Pro|专业版' } | Select-Object -First 1 }
+        if (-not $pick) { $pick = $images[0] }
+        Write-Host ("[image] no console: picked [{0}] {1} (EditionId={2}) of {3} - set IMAGE_INDEX to choose another" -f `
+            $pick.ImageIndex, $pick.ImageName, $pick.EditionId, $images.Count) -ForegroundColor Yellow
+        return [int]$pick.ImageIndex
     }
     do {
         $sel = (Read-Host "`nSelect image index").Trim()

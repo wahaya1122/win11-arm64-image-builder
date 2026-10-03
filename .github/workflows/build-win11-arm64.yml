@@ -19,6 +19,10 @@ name: Build Win11 ARM64 image (DroidVM)
 # image with compressed clusters reads as an empty disk and the firmware reports no boot device.
 # Turn compress_qcow2 on only for a crosvm that can read zstd clusters.
 #
+# Default ISO: Microsoft's official Windows 11 Client ARM64 zh-cn media. The download link is a
+# time-limited signed URL (P1 is its expiry) - when it lapses, pass a fresh one as the src_iso
+# input (or update the defaults here) and leave src_iso_md5 empty to skip the hash gate.
+#
 # Triggers: every push to main/master, and manual runs with custom inputs.
 
 permissions:
@@ -32,7 +36,7 @@ on:
         required: false
         default: 'https://software.download.prss.microsoft.com/dbazure/Windows11_Client_arm64_zh-cn_26300_9457.iso?t=e2a709d6-93ec-4149-a9b2-ffb93a527fcc&P1=1791073370&P2=602&P3=2&P4=fV0QzHGjqlnT23Ut8%2fU4tO0c9PuyYDlXKbHDEdfyNyJ6Lm%2f3X8HN8N6dZiiB%2baTlhkD%2byTAk8QiXyiCG%2ftLDnN6zfK%2fmjL81DlX2a7oTcq5J51G8IK234%2blpdsC9A8ONnCmKdk5x0MeAO3DdV9U%2bnwi6TerQKn%2bIOYjx7hLCASBxidJo%2bOqDn%2fVY%2fVu3LWUPSE3EdaPP4fm%2fYBLazDBNJ12dAA98RswGYiq%2fQqYVmvoT%2fhjnxxnJ28YRqAGUdTbsIA1aVL0ky2bGVx2D5Y1QXV0EjCOBXRweRWAPTcWEO6JwftJlZSWxlX9rzG86AZoFgE5MRFMYcRexwaSACi%2fT8A%3d%3d'
       src_iso_md5:
-        description: 'Expected MD5 of the ISO (empty = skip the check)'
+        description: 'Expected MD5 of the ISO (empty = skip the check; the built hash is reported anyway)'
         required: false
         default: ''
       image_index:
@@ -93,8 +97,11 @@ jobs:
       IN_PASSWORD: ${{ github.event.inputs.dvm_password }}
       IN_PUBLISH_RELEASE: ${{ github.event.inputs.publish_release }}
       IN_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
-      DEFAULT_ISO: 'https://archive.org/download/tiny11_25H2/tiny11core_25H2_Oct25_arm64.iso'
-      DEFAULT_ISO_MD5: 'd9fdad2c652c33121bb14cb7c0ce2b3f'
+      DEFAULT_ISO: 'https://software.download.prss.microsoft.com/dbazure/Windows11_Client_arm64_zh-cn_26300_9457.iso?t=e2a709d6-93ec-4149-a9b2-ffb93a527fcc&P1=1791073370&P2=602&P3=2&P4=fV0QzHGjqlnT23Ut8%2fU4tO0c9PuyYDlXKbHDEdfyNyJ6Lm%2f3X8HN8N6dZiiB%2baTlhkD%2byTAk8QiXyiCG%2ftLDnN6zfK%2fmjL81DlX2a7oTcq5J51G8IK234%2blpdsC9A8ONnCmKdk5x0MeAO3DdV9U%2bnwi6TerQKn%2bIOYjx7hLCASBxidJo%2bOqDn%2fVY%2fVu3LWUPSE3EdaPP4fm%2fYBLazDBNJ12dAA98RswGYiq%2fQqYVmvoT%2fhjnxxnJ28YRqAGUdTbsIA1aVL0ky2bGVx2D5Y1QXV0EjCOBXRweRWAPTcWEO6JwftJlZSWxlX9rzG86AZoFgE5MRFMYcRexwaSACi%2fT8A%3d%3d'
+      # Left empty: the signed link above is ephemeral, so gate on the size/dism instead. Fill in the
+      # hash the run reports if you want the hard check (e.g. for the archive.org tiny11 media:
+      # d9fdad2c652c33121bb14cb7c0ce2b3f).
+      DEFAULT_ISO_MD5: ''
       # Repo-local cache dir used by windows/build.ps1 for the ISO / drivers / OpenSSH payload.
       DVM_FILES: ${{ github.workspace }}\windows\files
 
@@ -214,15 +221,18 @@ jobs:
           $size = (Get-Item $SRC).Length
           Write-Host ("ISO: {0} ({1:N2} GB)" -f $SRC, ($size/1GB))
 
+          # Always hash what we downloaded (the signed link is ephemeral, so an expected hash is
+          # optional) and publish the real value in the release notes.
+          $md5 = (Get-FileHash -Algorithm MD5 -Path $SRC).Hash.ToLower()
+          "ISO_MD5_ACTUAL=$md5" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           if ($env:SRC_ISO_MD5) {
-            $md5 = (Get-FileHash -Algorithm MD5 -Path $SRC).Hash.ToLower()
             Write-Host "MD5: $md5 (expected $($env:SRC_ISO_MD5))"
             if ($md5 -ne $env:SRC_ISO_MD5.ToLower()) {
               Remove-Item $SRC -Force -ErrorAction SilentlyContinue
               throw "ISO MD5 mismatch (got $md5, expected $($env:SRC_ISO_MD5)) - partial download removed, re-run"
             }
           } else {
-            Write-Host 'MD5 check skipped'
+            Write-Host "MD5: $md5 (no expected hash given, check skipped)"
           }
           "SRC_ISO=$SRC" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           # Scratch (the expandable VHDX + any ESD->WIM export) goes on the roomiest drive.
@@ -269,6 +279,8 @@ jobs:
 
       - name: Upload qcow2
         if: always() && env.UPLOAD_QCOW2 == 'true'
+        # Redundant with the release: a storage-quota hiccup here must not sink the run.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: win11-arm64-droidvm-qcow2
@@ -280,6 +292,7 @@ jobs:
 
       - name: Upload vmpkg
         if: always() && env.UPLOAD_VMPKG == 'true'
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: win11-arm64-droidvm-vmpkg
@@ -384,7 +397,7 @@ jobs:
             'Automated build of the Win11 ARM64 image for DroidVM (Gunyah/crosvm).',
             '',
             "- source ISO: $($env:SRC_ISO_INPUT)",
-            "- ISO md5: $($env:SRC_ISO_MD5)",
+            "- ISO md5: $($env:ISO_MD5_ACTUAL) (expected: $($env:SRC_ISO_MD5))",
             "- runner: windows-11-arm, $($env:GITHUB_SERVER_URL)/$repo/actions/runs/$($env:GITHUB_RUN_ID)",
             "- image: Windows 11 Pro ARM64 (tiny11core 25H2), testsigning + nointegritychecks on,",
             '  gunyah virtio drivers injected offline (NetKVM rdmapool pvmpower vioinput viostor vioscsi viosnd viofs)',
