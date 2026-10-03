@@ -11,8 +11,13 @@ name: Build Win11 ARM64 image (DroidVM)
 # (ready-to-import VM package with the SBSA console config baked in). Both are uploaded as
 # workflow artifacts and published as GitHub release assets.
 #
-# Release note: GitHub caps a release asset at 2 GiB, and the images are ~3.7 GiB, so the release
+# Release note: GitHub caps a release asset at 2 GiB, and the images are well past that, so the release
 # holds each image as 1900 MiB parts next to SHA256SUMS.txt and REASSEMBLE.txt.
+#
+# Compression: qcow2-compressed clusters are off by default. DroidVM v0.0.6 ships a crosvm whose
+# qcow2 backend has no zstd/libzstd and an explicit "compressed blocks not supported" path, so an
+# image with compressed clusters reads as an empty disk and the firmware reports no boot device.
+# Turn compress_qcow2 on only for a crosvm that can read zstd clusters.
 #
 # Triggers: every push to main/master, and manual runs with custom inputs.
 
@@ -35,9 +40,9 @@ on:
         required: false
         default: ''
       compress_qcow2:
-        description: 'zstd-compress qcow2 clusters (smaller; needs the new crosvm)'
+        description: 'zstd-compress qcow2 clusters (smaller, but DroidVM v0.0.6 crosvm cannot read them)'
         type: boolean
-        default: true
+        default: false
       upload_qcow2:
         description: 'Upload the raw .qcow2 artifact (big, ~5 GB)'
         type: boolean
@@ -109,7 +114,8 @@ jobs:
           $srcMd5   = Pick $env:IN_SRC_ISO_MD5 $env:DEFAULT_ISO_MD5
           $username = Pick $env:IN_USERNAME  'USER'
           $password = Pick $env:IN_PASSWORD  'DroidVM'
-          $compress = if ([string]::IsNullOrWhiteSpace($env:IN_COMPRESS)) { 'true' } else { $env:IN_COMPRESS }
+          # Must mirror the compress_qcow2 input default: a push-triggered run has no inputs at all.
+          $compress = if ([string]::IsNullOrWhiteSpace($env:IN_COMPRESS)) { 'false' } else { $env:IN_COMPRESS }
           $upQcow   = if ([string]::IsNullOrWhiteSpace($env:IN_UPLOAD_QCOW2)) { 'true' } else { $env:IN_UPLOAD_QCOW2 }
           $upVmpkg  = if ([string]::IsNullOrWhiteSpace($env:IN_UPLOAD_VMPKG)) { 'true' } else { $env:IN_UPLOAD_VMPKG }
           $publish  = if ([string]::IsNullOrWhiteSpace($env:IN_PUBLISH_RELEASE)) { 'true' } else { $env:IN_PUBLISH_RELEASE }
@@ -301,6 +307,11 @@ jobs:
           # Release assets are capped at 2 GiB each and the images are ~3.7 GiB, so publish each
           # image as 1900 MiB parts, with a checksum manifest and reassembly instructions.
           $limit = 1900MB
+          $clusterText = if ($env:COMPRESS_FLAG -eq 'true') {
+            'zstd-compressed (needs a crosvm with qcow2 zstd read support)'
+          } else {
+            'uncompressed (readable by any crosvm, DroidVM v0.0.6 included)'
+          }
           $manifest = New-Object System.Collections.Generic.List[string]
           $assets   = New-Object System.Collections.Generic.List[string]
           $joinNix  = New-Object System.Collections.Generic.List[string]
@@ -361,7 +372,7 @@ jobs:
               '',
               'Then either import the .vmpkg in the DroidVM app (VM config is baked in: 4 GB RAM,',
               '4 CPU, swiotlb 256 MB, SBSA console), or point crosvm at the .qcow2 directly.',
-              'The qcow2 has zstd-compressed clusters -> needs the crosvm with qcow2 zstd read support.',
+              "The qcow2 clusters are $clusterText.",
               '',
               'Split sizes: 1900 MiB per part, last part is the remainder.')) { $lines.Add($l) }
           $reassemblePath = Join-Path $outDir 'REASSEMBLE.txt'
@@ -381,7 +392,7 @@ jobs:
             '  debloats (Windows Update off, re-enable with the enable_windows_update.bat on the desktop)',
             '- SAC: BCD EMS armed; the interactive SAC> runtime is pulled from Windows Update on the',
             '  first boot of the target VM (needs network there)',
-            '- qcow2 clusters are zstd-compressed -> needs the crosvm with qcow2 zstd read support',
+            "- qcow2 clusters are $clusterText",
             '',
             'Assets are split into <2 GiB parts: see REASSEMBLE.txt and SHA256SUMS.txt.'
           ) -join "`n")
